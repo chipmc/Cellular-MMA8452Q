@@ -1,0 +1,15 @@
+{
+  "event": "Send_Counts",
+  "url": "https://things.ubidots.com/api/v1.6/devices/{{PARTICLE_DEVICE_ID}}/?token=6EALvOEabrFiA6XViWY3hxcFMG0yDr",
+  "requestType": "POST",
+  "mydevices": true,
+  "noDefaults": true,
+  "responseTemplate": "{{hourly.0.status_code}}",
+  "responseTopic": "{{PARTICLE_DEVICE_ID}}_Send_Counts",
+  "json":{
+    "hourly": "{{hourly}}",
+    "daily": "{{daily}}",
+    "battery": "{{battery}}",
+    "temp": "{{temp}}"
+  }
+}

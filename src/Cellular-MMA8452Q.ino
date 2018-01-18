@@ -42,16 +42,20 @@
 #define CURRENTHOURLYCOUNTADDR 0x8  // Current Hourly Count - 16 bits
 #define CURRENTHOURLYDURATIONADDR 0xA   // Current Hourly Duration Count - 16 bits
 #define CURRENTDAILYCOUNTADDR 0xC   // Current Daily Count - 16 bits
-#define CURRENTCOUNTSTIME 0xC       // Time of last count - 32 bits
+#define CURRENTCOUNTSTIME 0xE       // Time of last count - 32 bits
                                     // Six open bytes here which takes us to the third word
 //These are the hourly and daily offsets that make up the respective words
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.30"
-#define PARKCLOSES 20
-#define PARKOPENS 6
+#define SOFTWARERELEASENUMBER "0.36"
+#define PARKCLOSES 18
+#define PARKOPENS 8
 #define LOCALTIMEZONE -5
+
+// Here are some switches to support pilots vs. production
+const bool solarPowered = false;
+const bool verboseMode = false;
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                           // Library for FRAM functions
@@ -121,7 +125,8 @@ byte Sensitivity;                    // Hex variable for sensitivity - Initializ
 int inputSensitivity;                // Raw sensitivity input - Initialized in Setup (0 least sensitive -9 most sensitive)
 int debounce;                        // Debounce value is initialized in setup (debounce is divided by 10 to reduce FRAM storage)
 volatile bool sensorDetect = false;       // This is the flag that an interrupt is triggered
-volatile unsigned long lastEvent = 0;       // Keeps track of the last time there was an event
+unsigned long lastEvent = 0;       // Keeps track of the last time there was an event
+bool sensorLockedUp = false;       // Flag for automatic reset if reporting 0 during working hours
 
 // Battery monitor
 int stateOfCharge = 0;                      // stores battery charge level value
@@ -135,6 +140,8 @@ const char* levels[6] = {"Poor", "Low", "Medium", "Good", "Very Good", "Great"};
 
 void setup()                                                      // Note: Disconnected Setup()
 {
+  Wire.begin();                       //Create a Wire object
+
   pinMode(int2Pin,INPUT);                                         // accelerometer interrupt pinMode
   pinMode(wakeUpPin,INPUT);                                       // This pin is active HIGH
   pinMode(userSwitch,INPUT);                                      // Momentary contact button on board for direct user input
@@ -146,7 +153,7 @@ void setup()                                                      // Note: Disco
   digitalWrite(donePin,LOW);                                      // Pet the watchdog
   pinMode(hardResetPin,OUTPUT);                                   // For a hard reset active HIGH
 
-  PMICreset();                                                    // Executes commands that set up the PMIC for Solar charging
+  //PMICreset();                                                    // Executes commands that set up the PMIC for Solar charging
 
   attachInterrupt(int2Pin,sensorISR,RISING);         // Accelerometer interrupt from low to high
   attachInterrupt(wakeUpPin, watchdogISR, RISING);   // The watchdog timer will signal us and we have to respond
@@ -226,7 +233,6 @@ void setup()                                                      // Note: Disco
     controlRegister = (0b1111110 & controlRegister);                    // Turn off Low power mode
     FRAMwrite8(CONTROLREGISTER,controlRegister);                        // Write it to the register
   }
-
   if (!lowPowerMode && !(Time.hour() >= PARKCLOSES || Time.hour() < PARKOPENS)) connectToParticle();  // If not lowpower or sleeping, we can connect
 
   takeMeasurements();
@@ -298,6 +304,7 @@ void loop()
 
   case LOW_BATTERY_STATE: {
       if (Particle.connected()) {
+        Particle.publish("State","Low Battery State");
         disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
       }
       detachInterrupt(intPin);                                  // Done sensing for the day
@@ -321,7 +328,7 @@ void loop()
     takeMeasurements();
     if (Status[0] != '\0')
     {
-      Particle.publish("Status",Status);  // Will continue - even if not connected.
+      if (verboseMode) Particle.publish("Status",Status);  // Will continue - even if not connected.
       Status[0] = '\0';
     }
     LogHourlyEvent();
@@ -329,15 +336,20 @@ void loop()
     publishTimeStamp = millis();
     digitalWrite(donePin,HIGH);
     digitalWrite(donePin,LOW);                          // Pet the watchdog once an hour
-    Particle.publish("State","Waiting for Response");
+    if (verboseMode) Particle.publish("State","Waiting for Response");
     state = RESP_WAIT_STATE;                            // Wait for Response
     } break;
 
   case RESP_WAIT_STATE:
     if (!dataInFlight)                                  // Response received
     {
+      if (!hourlyPersonCount && !(Time.hour() >= PARKCLOSES || Time.hour() < PARKOPENS)) {  // Zero count during park hours
+        sensorLockedUp = true;
+        state = ERROR_STATE;
+        break;
+      }
       state = IDLE_STATE;
-      Particle.publish("State","Idle");
+      if (verboseMode) Particle.publish("State","Idle");
     }
     else if (millis() >= (publishTimeStamp + webhookWaitTime)) {
       state = ERROR_STATE;  // Response timed out
@@ -354,7 +366,9 @@ void loop()
     if (millis() >= (resetWaitTimeStamp + resetWaitTime))
     {
       if (resetCount <= 3)  System.reset();                 // Today, only way out is reset
-      else {
+      else if (resetCount > 3 || sensorLockedUp) {
+        Particle.publish("State","Hard reset initiated");
+        delay(2000);
         FRAMwrite8(RESETCOUNT,0);                           // Time for a hard reset
         digitalWrite(hardResetPin,HIGH);                    // Zero the count so only every three
       }
@@ -362,14 +376,24 @@ void loop()
     break;
   }
 }
-
+/*
 void recordCount()                                          // Handles counting when the sensor triggers
 {
+  int i=0;
   char data[256];                                           // Store the date in this character array - not global
   sensorDetect = false;                                     // Reset the flag
-  unsigned long threshold = 1.5 * debounce;
-  unsigned long howLong = millis() - lastEvent;
-  if (howLong > threshold) {                  // So, if there has been more than 1.5x debounce, will count as a seprate "person count"
+  byte source = readRegister(MMA8452_ADDRESS,0x0C);         // Read the interrupt source reg.
+  do {                                                    // All these gymanastics are required to ensure the interrupt is reset
+      i++;                                                // Apparently, this is an issue with the MMA8452
+      readRegister(MMA8452_ADDRESS,0x22);                 // Reads the PULSE_SRC register to reset it
+      if (i>=10)                                          // Not sure if this is requried - take out after a month if never triggered
+      {
+        initMMA8452(accelFullScaleRange,dataRate);        // Last Resort
+        Particle.publish("Accelerometer","Reset");
+      }
+  } while(digitalRead(int2Pin));                          // Won't exit the do loop until the accelerometer's interrupt is reset
+  Serial.println("tap");
+  if ((source & 0x08)==0x08) {
     t = Time.now();
     lastEvent = millis();                                   // If it is an event then we reset the lastEvent value
     hourlyPersonCount++;                                    // Increment the PersonCount
@@ -382,10 +406,58 @@ void recordCount()                                          // Handles counting 
     snprintf(data, sizeof(data), "Hourly count: %i",hourlyPersonCount);
     Particle.publish("Count",data);
   }
+  else if ((source & 0x08) != 0x08) Serial.println(F("Interrupt not a tap"));
   if (!digitalRead(userSwitch)) {     // A low value means someone is pushing this button
     state = REPORTING_STATE;          // If so, connect and send data - this let's us interact with the device if needed
   }
 }
+*/
+void recordCount() // This is where we check to see if an interrupt is set when not asleep or act on a tap that woke the Arduino
+{
+  int i=0;
+  byte source = readRegister(MMA8452_ADDRESS,0x0C);       // Read the interrupt source reg.
+  do {                                                    // All these gymanastics are required to ensure the interrupt is reset
+      i++;                                                // Apparently, this is an issue with the MMA8452
+      readRegister(MMA8452_ADDRESS,0x22);                 // Reads the PULSE_SRC register to reset it
+      if (i>=10)                                          // Not sure if this is requried - take out after a month if never triggered
+      {
+        initMMA8452(accelFullScaleRange,dataRate);        // Last Resort
+        Particle.publish("Accelerometer","Reset");
+      }
+  } while(digitalRead(int2Pin));                          // Won't exit the do loop until the accelerometer's interrupt is reset
+  sensorDetect = false;      // Reset the flag
+  if ((source & 0x08)==0x08 && millis() >= lastEvent + debounce)  // We are only interested in the TAP register and ignore debounced taps
+  {
+    Serial.println(F("It is a tap - counting"));
+    lastEvent = millis();    // Reset last bump timer
+    t = Time.now();
+    hourlyPersonCount++;                    // Increment the PersonCount
+    FRAMwrite16(CURRENTHOURLYCOUNTADDR, hourlyPersonCount);  // Load Hourly Count to memory
+    dailyPersonCount++;                    // Increment the PersonCount
+    FRAMwrite16(CURRENTDAILYCOUNTADDR, dailyPersonCount);   // Load Daily Count to memory
+    FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
+    Serial.print(F("Hourly: "));
+    Serial.print(hourlyPersonCount);
+    Serial.print(F(" Daily: "));
+    Serial.print(dailyPersonCount);
+    Serial.print(F("  Time: "));
+    Serial.println(Time.timeStr(t)); // Prints time t - example: Wed May 21 01:08:47 2014
+    ledState = !ledState;              // toggle the status of the LEDPIN:
+    digitalWrite(blueLED, ledState);    // update the LED pin itself
+  }
+  else if (millis() < lastEvent + debounce) Serial.println(F("Tap was debounced"));
+  else if ((source & 0x08) != 0x08) Serial.println(F("Interrupt not a tap"));
+  if (!digitalRead(userSwitch)) {     // A low value means someone is pushing this button - will trigger a send to Ubidots and take out of low power mode
+    if (lowPowerMode) {
+      controlRegister = (0b1111110 & controlRegister);                  // Will set the lowPowerMode bit to zero
+      lowPowerMode = false;
+      connectToParticle();
+      Particle.publish("Mode","Normal Operations");
+    }
+    state = REPORTING_STATE;          // If so, connect and send data - this let's us interact with the device if needed
+  }
+}
+
 
 void StartStopTest(boolean startTest)  // Since the test can be started from the serial menu or the Simblee - created a function
 {
@@ -586,9 +658,12 @@ int getTemperature()
 
 void sensorISR()
 {
+  /*
   if ((millis()-lastEvent) > debounce) {                    // Can read millis() in an ISR but it won't increment
     sensorDetect = true;                                    // sets the sensor flag for the main loop
   }
+  */
+  sensorDetect = true;
 }
 
 void watchdogISR()
@@ -633,12 +708,20 @@ void takeMeasurements() {
 }
 
 void PMICreset() {
-  power.begin();                                                  // Settings for Solar powered power management
+  power.begin();                                            // Settings for Solar powered power management
   power.disableWatchdog();
-  power.disableDPDM();
-  power.setInputVoltageLimit(4840);     //Set the lowest input voltage to 4.84 volts. This keeps my 5v solar panel from operating below 4.84 volts (defauly 4360)
-  power.setInputCurrentLimit(900);                                // default is 900mA
-  power.setChargeCurrent(0,0,0,0,0,0);                            // default is 512mA matches my 3W panel
-  power.setChargeVoltage(4112);                                   // default is 4.112V termination voltage
-  power.enableDPDM();
+//  power.disableDPDM();
+  if (solarPowered) {
+    power.setInputVoltageLimit(4840);                       // Set the lowest input voltage to 4.84 volts best setting for 6V solar panels
+    power.setInputCurrentLimit(900);                        // default is 900mA
+    power.setChargeCurrent(0,0,1,0,0,0);                    // default is 512mA matches my 3W panel
+    power.setChargeVoltage(4112);                           // default is 4.112V termination voltage
+  }
+  else  {
+    power.setInputVoltageLimit(4208);                       // This is the default value for the Electron
+    power.setInputCurrentLimit(1500);                        // default is 900mA
+    power.setChargeCurrent(0,1,1,0,0,0);                    // default is 2048mA (011000) = 512mA+1024mA+512mA)
+    power.setChargeVoltage(4112);                           // default is 4.112V termination voltage
+  }
+//  power.enableDPDM();
 }

@@ -12,7 +12,7 @@
     enabling sleep  2) Low Battery Mode - reduced functionality to preserve battery charge
 
     The mode will be set and recoded in the CONTROLREGISTER so resets will not change the mode
-    Control Register - bits 7-2 reserved, 1 - Low Battery Mode, 0 - Low Power Mode
+    Control Register - bits 7-4, 3 - Verbose Mode, 2- Solar Power Mode, 1 - Low Battery Mode, 0 - Low Power Mode
 */
 
 // The SparkFun MMA8452 breakout board defaults to 1, set to 0 if SA0 jumper on the bottom of the board is set
@@ -36,26 +36,23 @@
 #define DEBOUNCEADDR 0x2            // One uint8_t for debounce (stored in cSec mult by 10 for mSec)
 #define RESETCOUNT 0x3              // This is where we keep track of how often the Electron was reset
                                     // One byte is open here
-#define HOURLYPOINTERADDR 0x5       // Two bytes for hourly pointer
-#define CONTROLREGISTER 0x7         // This is the control register for storing the current state - future use
+#define TIMEZONEADDR  0x5           // Store the local time zone data
+#define CONTROLREGISTER 0x7         // This is the control register for storing the current state
 //Second and Third words bytes for storing current counts
 #define CURRENTHOURLYCOUNTADDR 0x8  // Current Hourly Count - 16 bits
 #define CURRENTHOURLYDURATIONADDR 0xA   // Current Hourly Duration Count - 16 bits
 #define CURRENTDAILYCOUNTADDR 0xC   // Current Daily Count - 16 bits
 #define CURRENTCOUNTSTIME 0xE       // Time of last count - 32 bits
-                                    // Six open bytes here which takes us to the third word
+#define HOURLYPOINTERADDR 0x11       // Two bytes for hourly pointer
+                                    // Four open bytes here which takes us to the third word
 //These are the hourly and daily offsets that make up the respective words
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.36"
+#define SOFTWARERELEASENUMBER "0.40"
 #define PARKCLOSES 18
 #define PARKOPENS 8
 #define LOCALTIMEZONE -5
-
-// Here are some switches to support pilots vs. production
-const bool solarPowered = false;
-const bool verboseMode = false;
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                           // Library for FRAM functions
@@ -105,6 +102,9 @@ bool ledState = LOW;                        // variable used to store the last L
 const char* releaseNumber = SOFTWARERELEASENUMBER;  // Displays the release on the menu
 int lowBattLimit = 30;                      // Trigger for Low Batt State
 bool lowPowerMode;                          // Flag for Low Power Mode operations
+bool lowBatteryMode;                        // For when battery levels get critical
+bool verboseMode;                           // Enables more active communications for configutation and setup
+bool solarPowerMode;                        // Enables different power management settings
 byte controlRegister;                       // Stores the control register values
 
 // FRAM and Unix time variables
@@ -153,11 +153,11 @@ void setup()                                                      // Note: Disco
   digitalWrite(donePin,LOW);                                      // Pet the watchdog
   pinMode(hardResetPin,OUTPUT);                                   // For a hard reset active HIGH
 
-  //PMICreset();                                                    // Executes commands that set up the PMIC for Solar charging
+  //PMICreset();                                                  // Executes commands that set up the PMIC for Solar charging
 
-  attachInterrupt(int2Pin,sensorISR,RISING);         // Accelerometer interrupt from low to high
-  attachInterrupt(wakeUpPin, watchdogISR, RISING);   // The watchdog timer will signal us and we have to respond
-  attachInterrupt(intPin,sensorISR,RISING);   // Will know when the PIR sensor is triggered
+  attachInterrupt(int2Pin,sensorISR,RISING);                      // Accelerometer interrupt from low to high
+  attachInterrupt(wakeUpPin, watchdogISR, RISING);                // The watchdog timer will signal us and we have to respond
+  // attachInterrupt(intPin,sensorISR,RISING);                       // Will know when the PIR sensor is triggered
 
   char responseTopic[125];
   String deviceID = System.deviceID();                                // Multiple Electrons share the same hook - keeps things straight
@@ -184,6 +184,9 @@ void setup()                                                      // Note: Disco
   Particle.function("SetSensivty", setSensivty);
   Particle.function("SendNow",sendNow);
   Particle.function("LowPowerMode",setLowPowerMode);
+  Particle.function("Solar-Mode",setSolarMode);
+  Particle.function("Verbose-Mode",setVerboseMode);
+  Particle.function("Set-Timezone",setTimeZone);
 
   if (!fram.begin()) {                                                  // You can stick the new i2c addr in here, e.g. begin(0x51);
     snprintf(Status,13,"Missing FRAM");                                 // Can't communicate with FRAM - fatal error
@@ -203,37 +206,36 @@ void setup()                                                      // Note: Disco
   }
 
   // Import the inputSensitivity and Debounce values from memory
-  Serial.print(F("Sensitivity set to: "));
-  inputSensitivity = 10-FRAMread8(SENSITIVITYADDR);
-  Serial.println(inputSensitivity);
-  Serial.print(F("Debounce set to: "));
-  debounce = FRAMread8(DEBOUNCEADDR)*10;     // We mulitply by ten since debounce is stored in 100ths of a second
-  Serial.println(debounce);
+  inputSensitivity = 10-FRAMread8(SENSITIVITYADDR);                     // We store the inverse as humans think of 10 as more sensitive than 0
+  debounce = FRAMread8(DEBOUNCEADDR)*10;                                // We mulitply by ten since debounce is stored in 100ths of a second
+
 
   byte c = readRegister(MMA8452_ADDRESS,0x0D);  // Read WHO_AM_I register for accelerometer
   if (c == 0x2A) // WHO_AM_I should always be 0x2A
   {
     initMMA8452(accelFullScaleRange, dataRate);  // init the accelerometer if communication is OK
-    Serial.println(F("MMA8452Q is online..."));
   }
   else
   {
-    Serial.print(F("Could not connect to MMA8452Q: 0x"));
-    Serial.println(c, HEX);
+    state = ERROR_STATE;
   }
   initMMA8452(accelFullScaleRange,dataRate);
 
-  Time.zone(LOCALTIMEZONE);                                             // Set time zone as set in the #define section
+  int8_t tempTimeZoneOffset = FRAMread8(TIMEZONEADDR);                  // Load Time zone data from FRAM
+  Time.zone((float)tempTimeZoneOffset);
 
   controlRegister = FRAMread8(CONTROLREGISTER);                         // Read the Control Register for system modes
   lowPowerMode = (0b00000001 & controlRegister);                        // Bitwise AND to set the lowPowerMode flag from control Register
+  lowBatteryMode = (0b000000010 & controlRegister);                     // lowBatteryMode
+  verboseMode = (0b00001000 & controlRegister);                         // verboseMode
+  solarPowerMode = (0b00000100 & controlRegister);                      // solarPowerMode
 
   if (!digitalRead(userSwitch) && lowPowerMode) {                      // Rescue mode to locally take lowPowerMode so you can connect to device
     lowPowerMode = false;                                               // Press the user switch while resetting the device
     controlRegister = (0b1111110 & controlRegister);                    // Turn off Low power mode
     FRAMwrite8(CONTROLREGISTER,controlRegister);                        // Write it to the register
   }
-  if (!lowPowerMode && !(Time.hour() >= PARKCLOSES || Time.hour() < PARKOPENS)) connectToParticle();  // If not lowpower or sleeping, we can connect
+  if (!lowPowerMode && !lowBatteryMode && !(Time.hour() >= PARKCLOSES || Time.hour() < PARKOPENS)) connectToParticle();  // If not lowpower or sleeping, we can connect
 
   takeMeasurements();
   StartStopTest(1);                                                     // Default action is for the test to be running
@@ -307,6 +309,12 @@ void loop()
         Particle.publish("State","Low Battery State");
         disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
       }
+      if (!lowBatteryMode) {                                    // If flag and control register bit is not set - set it here
+        lowBatteryMode = true;                                  // Low battery flag prevents connecting at setup
+        controlRegister = FRAMread8(CONTROLREGISTER);
+        controlRegister = (0b00000010 || controlRegister);      // Update the register so persists after reboot
+        FRAMwrite8(CONTROLREGISTER,controlRegister);
+      }
       detachInterrupt(intPin);                                  // Done sensing for the day
       ledState = false;
       digitalWrite(blueLED,LOW);                                // Turn off the LED
@@ -376,44 +384,10 @@ void loop()
     break;
   }
 }
-/*
-void recordCount()                                          // Handles counting when the sensor triggers
-{
-  int i=0;
-  char data[256];                                           // Store the date in this character array - not global
-  sensorDetect = false;                                     // Reset the flag
-  byte source = readRegister(MMA8452_ADDRESS,0x0C);         // Read the interrupt source reg.
-  do {                                                    // All these gymanastics are required to ensure the interrupt is reset
-      i++;                                                // Apparently, this is an issue with the MMA8452
-      readRegister(MMA8452_ADDRESS,0x22);                 // Reads the PULSE_SRC register to reset it
-      if (i>=10)                                          // Not sure if this is requried - take out after a month if never triggered
-      {
-        initMMA8452(accelFullScaleRange,dataRate);        // Last Resort
-        Particle.publish("Accelerometer","Reset");
-      }
-  } while(digitalRead(int2Pin));                          // Won't exit the do loop until the accelerometer's interrupt is reset
-  Serial.println("tap");
-  if ((source & 0x08)==0x08) {
-    t = Time.now();
-    lastEvent = millis();                                   // If it is an event then we reset the lastEvent value
-    hourlyPersonCount++;                                    // Increment the PersonCount
-    FRAMwrite16(CURRENTHOURLYCOUNTADDR, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
-    dailyPersonCount++;                                     // Increment the PersonCount
-    FRAMwrite16(CURRENTDAILYCOUNTADDR, static_cast<uint16_t>(dailyPersonCount));   // Load Daily Count to memory
-    FRAMwrite32(CURRENTCOUNTSTIME, t);                      // Write to FRAM - this is so we know when the last counts were saved
-    ledState = !ledState;                                   // toggle the status of the LEDPIN:
-    digitalWrite(blueLED, ledState);                        // update the LED pin itself
-    snprintf(data, sizeof(data), "Hourly count: %i",hourlyPersonCount);
-    Particle.publish("Count",data);
-  }
-  else if ((source & 0x08) != 0x08) Serial.println(F("Interrupt not a tap"));
-  if (!digitalRead(userSwitch)) {     // A low value means someone is pushing this button
-    state = REPORTING_STATE;          // If so, connect and send data - this let's us interact with the device if needed
-  }
-}
-*/
+
 void recordCount() // This is where we check to see if an interrupt is set when not asleep or act on a tap that woke the Arduino
 {
+  char data[256];                                           // Store the date in this character array - not global
   int i=0;
   byte source = readRegister(MMA8452_ADDRESS,0x0C);       // Read the interrupt source reg.
   do {                                                    // All these gymanastics are required to ensure the interrupt is reset
@@ -428,7 +402,6 @@ void recordCount() // This is where we check to see if an interrupt is set when 
   sensorDetect = false;      // Reset the flag
   if ((source & 0x08)==0x08 && millis() >= lastEvent + debounce)  // We are only interested in the TAP register and ignore debounced taps
   {
-    Serial.println(F("It is a tap - counting"));
     lastEvent = millis();    // Reset last bump timer
     t = Time.now();
     hourlyPersonCount++;                    // Increment the PersonCount
@@ -436,17 +409,13 @@ void recordCount() // This is where we check to see if an interrupt is set when 
     dailyPersonCount++;                    // Increment the PersonCount
     FRAMwrite16(CURRENTDAILYCOUNTADDR, dailyPersonCount);   // Load Daily Count to memory
     FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
-    Serial.print(F("Hourly: "));
-    Serial.print(hourlyPersonCount);
-    Serial.print(F(" Daily: "));
-    Serial.print(dailyPersonCount);
-    Serial.print(F("  Time: "));
-    Serial.println(Time.timeStr(t)); // Prints time t - example: Wed May 21 01:08:47 2014
+    snprintf(data, sizeof(data), "Car, hourlry count: %i, daily count: %i",hourlyPersonCount,dailyPersonCount);
+    if (verboseMode) Particle.publish("Count",data);
     ledState = !ledState;              // toggle the status of the LEDPIN:
     digitalWrite(blueLED, ledState);    // update the LED pin itself
   }
-  else if (millis() < lastEvent + debounce) Serial.println(F("Tap was debounced"));
-  else if ((source & 0x08) != 0x08) Serial.println(F("Interrupt not a tap"));
+  else if (millis() < lastEvent + debounce) if(verboseMode) Particle.publish("Event","Car debounced");
+  else if ((source & 0x08) != 0x08) if(verboseMode) Particle.publish("Event","Interrupt not a tap");
   if (!digitalRead(userSwitch)) {     // A low value means someone is pushing this button - will trigger a send to Ubidots and take out of low power mode
     if (lowPowerMode) {
       controlRegister = (0b1111110 & controlRegister);                  // Will set the lowPowerMode bit to zero
@@ -596,23 +565,27 @@ int hardResetNow(String command)   // Will perform a hard reset on the Electron
 int setDebounce(String command)  // Will accept a new debounce value in the form "xxxx" where xxx is an integer for delay in mSec
 {
   char * pEND;
+  char data[256];
   debounce = strtol(command,&pEND,10);                    // Looks for the first integer and interprets it
   if ((debounce < 0) | (debounce > 5000)) return 0;       // Make sure it falls in a valid range or send a "fail" result
   FRAMwrite8(DEBOUNCEADDR, debounce/10);                  // Remember we store debounce in cSec
   napDelay = 2*debounce;                                  // These two are related
+  snprintf(data, sizeof(data), "Debounce set to %i mSec",debounce);
+  if (verboseMode) Particle.publish("Count",data);
   return 1;
 }
 
 int setSensivty(String command)  // Will accept a new debounce value in the form "debounce:xxx" where xxx is an integer for delay in mSec
 {
+  char data[256];
   char *pEND;
   inputSensitivity = strtol(command,&pEND,0);
   if ((inputSensitivity < 0) | (inputSensitivity > 10)) return 0;
-  Serial.print("sensitivity set to:");
-  Serial.println(inputSensitivity);
+  if(verboseMode) Particle.publish("Event","Set sensitivity");
   FRAMwrite8(SENSITIVITYADDR, 10-inputSensitivity);
   initMMA8452(accelFullScaleRange, dataRate);  // init the accelerometer if communication is OK
-  Serial.println(F(" MMA8452Q is online..."));
+  snprintf(data, sizeof(data), "Accelerometer online, sensitivity set to %i mSec",inputSensitivity);
+  if (verboseMode) Particle.publish("Count",data);
   return 1;
 }
 
@@ -710,18 +683,80 @@ void takeMeasurements() {
 void PMICreset() {
   power.begin();                                            // Settings for Solar powered power management
   power.disableWatchdog();
-//  power.disableDPDM();
-  if (solarPowered) {
+  if (solarPowerMode) {
     power.setInputVoltageLimit(4840);                       // Set the lowest input voltage to 4.84 volts best setting for 6V solar panels
     power.setInputCurrentLimit(900);                        // default is 900mA
     power.setChargeCurrent(0,0,1,0,0,0);                    // default is 512mA matches my 3W panel
-    power.setChargeVoltage(4112);                           // default is 4.112V termination voltage
+    power.setChargeVoltage(4208);                           // Allows us to charge cloe to 100% - battery can't go over 45 celcius
   }
   else  {
     power.setInputVoltageLimit(4208);                       // This is the default value for the Electron
-    power.setInputCurrentLimit(1500);                        // default is 900mA
+    power.setInputCurrentLimit(1500);                       // default is 900mA this let's me charge faster
     power.setChargeCurrent(0,1,1,0,0,0);                    // default is 2048mA (011000) = 512mA+1024mA+512mA)
     power.setChargeVoltage(4112);                           // default is 4.112V termination voltage
   }
-//  power.enableDPDM();
+}
+
+int setSolarMode(String command) // Function to force sending data in current hour
+{
+  if (command == "1")
+  {
+    solarPowerMode = true;
+    FRAMread8(CONTROLREGISTER);
+    controlRegister = (0b00000100 | controlRegister);          // Turn on solarPowerMode
+    FRAMwrite8(CONTROLREGISTER,controlRegister);               // Write it to the register
+    PMICreset();                                               // Change the power management Settings
+    Particle.publish("Mode","Set Solar Powered Mode");
+    return 1;
+  }
+  else if (command == "0")
+  {
+    solarPowerMode = false;
+    FRAMread8(CONTROLREGISTER);
+    controlRegister = (0b11111011 & controlRegister);           // Turn off solarPowerMode
+    FRAMwrite8(CONTROLREGISTER,controlRegister);                // Write it to the register
+    PMICreset();                                                // Change the power management settings
+    Particle.publish("Mode","Cleared Solar Powered Mode");
+    return 1;
+  }
+  else return 0;
+}
+
+int setVerboseMode(String command) // Function to force sending data in current hour
+{
+  if (command == "1")
+  {
+    verboseMode = true;
+    FRAMread8(CONTROLREGISTER);
+    controlRegister = (0b00001000 | controlRegister);                    // Turn on verboseMode
+    FRAMwrite8(CONTROLREGISTER,controlRegister);                        // Write it to the register
+    Particle.publish("Mode","Set Verbose Mode");
+    return 1;
+  }
+  else if (command == "0")
+  {
+    verboseMode = false;
+    FRAMread8(CONTROLREGISTER);
+    controlRegister = (0b11110111 & controlRegister);                    // Turn off verboseMode
+    FRAMwrite8(CONTROLREGISTER,controlRegister);                        // Write it to the register
+    Particle.publish("Mode","Cleared Verbose Mode");
+    return 1;
+  }
+  else return 0;
+}
+
+int setTimeZone(String command)
+{
+  char * pEND;
+  char data[256];
+  int8_t tempTimeZoneOffset = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
+  if ((tempTimeZoneOffset < -12) | (tempTimeZoneOffset > 12)) return 0;   // Make sure it falls in a valid range or send a "fail" result
+  Time.zone((float)tempTimeZoneOffset);
+  FRAMwrite8(TIMEZONEADDR,tempTimeZoneOffset);                             // Store the new value in FRAMwrite8
+  t = Time.now();
+  snprintf(data, sizeof(data), "Time zone offset %i",tempTimeZoneOffset);
+  Particle.publish("Time",data);
+  delay(1000);
+  Particle.publish("Time",Time.timeStr(t));
+  return 1;
 }

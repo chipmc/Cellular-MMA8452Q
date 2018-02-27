@@ -49,7 +49,7 @@
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.50"
+#define SOFTWARERELEASENUMBER "0.51"
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                           // Library for FRAM functions
@@ -185,7 +185,7 @@ void setup()                                                      // Note: Disco
 
 
   if (!fram.begin()) {                                                  // You can stick the new i2c addr in here, e.g. begin(0x51);
-    resetTimeStamp - millis();                                          // Can't communicate with FRAM - fatal error
+    resetTimeStamp = millis();                                          // Can't communicate with FRAM - fatal error
     state = ERROR_STATE;
   }
   else if (FRAMread8(VERSIONADDR) != VERSIONNUMBER) {                   // Check to see if the memory map in the sketch matches the data on the chip
@@ -215,14 +215,14 @@ void setup()                                                      // Note: Disco
 
   int8_t tempTimeZoneOffset = FRAMread8(TIMEZONE);                      // Load Time zone data from FRAM
   if (tempTimeZoneOffset <= 12 && tempTimeZoneOffset >= -12)  Time.zone((float)tempTimeZoneOffset);  // Load Timezone from FRAM
-  else Time.zone(-5);                                                   // Default is EST in case proper value not in FRAM
+  else Time.zone(0);                                                   // Default is GMT in case proper value not in FRAM
 
   controlRegister = FRAMread8(CONTROLREGISTER);                         // Read the Control Register for system modes
   lowPowerMode = (0b00000001 & controlRegister);                        // Bitwise AND to set the lowPowerMode flag from control Register
   verboseMode = (0b00001000 & controlRegister);                         // verboseMode
   solarPowerMode = (0b00000100 & controlRegister);                      // solarPowerMode
 
-  PMICreset();                                                    // Executes commands that set up the PMIC for Solar charging
+  PMICreset();                                                          // Executes commands that set up the PMIC for Solar charging
 
   takeMeasurements();
 
@@ -237,10 +237,16 @@ void setup()                                                      // Note: Disco
   dailyPersonCount = FRAMread16(CURRENTDAILYCOUNT);                     // Load Daily Count from memory
   hourlyPersonCount = FRAMread16(CURRENTHOURLYCOUNT);                   // Load Hourly Count from memory
 
-  if (!digitalRead(userSwitch) && lowPowerMode) {                      // Rescue mode to locally take lowPowerMode so you can connect to device
+  if (!digitalRead(userSwitch)) {                                       // Rescue mode to locally take lowPowerMode so you can connect to device
     lowPowerMode = false;                                               // Press the user switch while resetting the device
     controlRegister = (0b1111110 & controlRegister);                    // Turn off Low power mode
     FRAMwrite8(CONTROLREGISTER,controlRegister);                        // Write it to the register
+    openTime = 0;                                                       // Device may alos be sleeping due to time or TimeZone setting
+    FRAMwrite8(OPENTIMEADDR,0);                                         // Reset open and close time values to ensure device is awake
+    closeTime = 24;
+    FRAMwrite8(CLOSETIMEADDR,24);
+    connectToParticle();                                                // Connects the Electron to Particle so you can control it
+    Particle.publish("Startup","Startup rescue - reset time and power");
   }
 
   byte c = readRegister(MMA8452_ADDRESS,0x0D);  // Read WHO_AM_I register for accelerometer
@@ -248,7 +254,11 @@ void setup()                                                      // Note: Disco
   {
     initMMA8452(accelFullScaleRange, dataRate);  // init the accelerometer if communication is OK
   }
-  else state = ERROR_STATE;
+  else
+  {
+    resetTimeStamp = millis();                                          // Can't communicate with FRAM - fatal error
+    state = ERROR_STATE;
+  }
   initMMA8452(accelFullScaleRange,dataRate);
 
   attachInterrupt(int2Pin,sensorISR,RISING);                      // Accelerometer interrupt from low to high
@@ -261,16 +271,16 @@ void loop()
 {
   switch(state) {
   case IDLE_STATE:
-    if(hourlyPersonCountSent) {   // Cleared here as there could be counts coming in while "in Flight"
-      hourlyPersonCount -= hourlyPersonCountSent;    // Confirmed that count was recevied - clearing
+    if(hourlyPersonCountSent) {                                                   // Cleared here as there could be counts coming in while "in Flight"
+      hourlyPersonCount -= hourlyPersonCountSent;                                 // Confirmed that count was recevied - clearing
       FRAMwrite16(CURRENTHOURLYCOUNT, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
       hourlyPersonCountSent = 0;
     }
-    if (sensorDetect) recordCount();                                                                    // The ISR had raised the sensor flag
+    if (sensorDetect) recordCount();                                              // The ISR had raised the sensor flag
     if (lowPowerMode && (millis() > stayAwakeTimeStamp + stayAwake)) state = NAPPING_STATE;
-    if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;    // We want to report on the hour but not after bedtime
+    if (Time.hour() != currentHourlyPeriod) state = REPORTING_STATE;              // We want to report on the hour but not after bedtime
     if ((Time.hour() >= closeTime || Time.hour() < openTime)) state = SLEEPING_STATE;   // The park is closed, time to sleep
-    if (stateOfCharge <= lowBattLimit) state = LOW_BATTERY_STATE;               // The battery is low - sleep
+    if (stateOfCharge <= lowBattLimit) state = LOW_BATTERY_STATE;                 // The battery is low - sleep
     break;
 
   case SLEEPING_STATE: {                                        // This state is triggered once the park closes and runs until it opens
@@ -316,11 +326,11 @@ void loop()
       if (Particle.connected()) {
         disconnectFromParticle();                                       // If connected, we need to disconned and power down the modem
       }
-      detachInterrupt(intPin);                                          // Done sensing for the day
+      detachInterrupt(int2Pin);                                          // Done sensing for the day
       ledState = false;
       digitalWrite(blueLED,LOW);                                        // Turn off the LED
       digitalWrite(tmp36Shutdwn, LOW);                                  // Turns off the temp sensor
-      watchdogISR();                                       // Pet the watchdog
+      watchdogISR();                                                    // Pet the watchdog
       int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
       System.sleep(SLEEP_MODE_DEEP,secondsToHour);                      // Very deep sleep till the next hour - then resets
     } break;
@@ -337,8 +347,8 @@ void loop()
       }
       takeMeasurements();                                                 // Update Temp, Battery and Signal Strength values
       sendEvent();                                                        // Send data to Ubidots
-      webhookTimeStamp = millis();
       if (verboseMode) Particle.publish("State","Waiting for Response");
+      webhookTimeStamp = millis();
       state = RESP_WAIT_STATE;                                            // Wait for Response
     } break;
 

@@ -12,7 +12,7 @@
     enabling sleep  2) Low Battery Mode - reduced functionality to preserve battery charge
 
     The mode will be set and recoded in the CONTROLREGISTER so resets will not change the mode
-    Control Register - bits 7-4, 3 - Verbose Mode, 2- Solar Power Mode, 1 - Low Battery Mode, 0 - Low Power Mode
+    Control Register - bits 7-5, 4-Connected Status, 3 - Verbose Mode, 2- Solar Power Mode, 1 - Low Battery Mode, 0 - Low Power Mode
 */
 
 // The SparkFun MMA8452 breakout board defaults to 1, set to 0 if SA0 jumper on the bottom of the board is set
@@ -49,7 +49,7 @@
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.53"
+#define SOFTWARERELEASENUMBER "0.57"
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                           // Library for FRAM functions
@@ -103,6 +103,7 @@ bool dataInFlight = false;                          // Tracks if we have sent da
 const char* releaseNumber = SOFTWARERELEASENUMBER;  // Displays the release on the menu
 byte controlRegister;                               // Stores the control register values
 bool lowPowerMode;                                  // Flag for Low Power Mode operations
+bool connectionMode;
 bool solarPowerMode;                                // Changes the PMIC settings
 bool verboseMode;                                   // Enables more active communications for configutation and setup
 char SignalString[17];                           // Used to communicate Wireless RSSI and Description
@@ -209,18 +210,24 @@ void setup()                                                      // Note: Disco
       FRAMwrite8(CONTROLREGISTER,0);                                    // Need to reset so not in low power or low battery mode
       FRAMwrite8(OPENTIMEADDR,0);                                       // These set the defaults if the FRAM is erased
       FRAMwrite8(CLOSETIMEADDR,24);                                     // This will ensure the device does not sleep
+      FRAMwrite8(DEBOUNCEADDR,4);                                       // Sets a debounce of 400mSec
     }
   }
 
   resetCount = FRAMread8(RESETCOUNT);                                   // Retrive system recount data from FRAM
-  if (System.resetReason() == RESET_REASON_PIN_RESET)                   // Check to see if we are starting from a pin reset
+  if (System.resetReason() == RESET_REASON_PIN_RESET || System.resetReason() == RESET_REASON_USER)  // Check to see if we are starting from a pin reset or a reset in the sketch
   {
     resetCount++;
     FRAMwrite8(RESETCOUNT,static_cast<uint8_t>(resetCount));            // If so, store incremented number - watchdog must have done This
   }
+  if (resetCount >=6) {                                                 // If we get to resetCount 4, we are resetting without entering the main loop
+    FRAMwrite8(RESETCOUNT,4);                                            // The hope here is to get to the main loop and report a value of 4 which will indicate this issue is occuring
+    fullModemReset();                                                   // This will reset the modem and the device will reboot
+  }
 
   // Import the inputSensitivity and Debounce values from memory
   inputSensitivity = 10-FRAMread8(SENSITIVITYADDR);                     // We store the inverse as humans think of 10 as more sensitive than 0
+  debounce = 100*FRAMread8(DEBOUNCEADDR);
   openTime = FRAMread8(OPENTIMEADDR);
   closeTime = FRAMread8(CLOSETIMEADDR);
 
@@ -232,12 +239,13 @@ void setup()                                                      // Note: Disco
   lowPowerMode = (0b00000001 & controlRegister);                        // Bitwise AND to set the lowPowerMode flag from control Register
   verboseMode = (0b00001000 & controlRegister);                         // verboseMode
   solarPowerMode = (0b00000100 & controlRegister);                      // solarPowerMode
+  connectionMode = (0b00010000 & controlRegister);                      // connected mode 1 = connected and 0 = disconnected
 
   PMICreset();                                                          // Executes commands that set up the PMIC for Solar charging
 
   takeMeasurements();
 
-  if (!lowPowerMode && (stateOfCharge >= lowBattLimit) && !(Time.hour() >= closeTime || Time.hour() < openTime)) connectToParticle();  // If not lowpower or sleeping, we can connect
+  if (connectionMode) connectToParticle();  // If not lowpower or sleeping, we can connect
 
   currentHourlyPeriod = Time.hour();                                    // Sets the hour period for when the count starts (see #defines)
   currentDailyPeriod = Time.day();                                      // And the day  (see #defines)
@@ -296,16 +304,14 @@ void loop()
     break;
 
   case SLEEPING_STATE: {                                        // This state is triggered once the park closes and runs until it opens
-    if (verboseMode && state != oldState) publishStateTransition();
+    if (connectionMode && verboseMode && state != oldState) publishStateTransition();
     if (!readyForBed)                                           // Only do these things once - at bedtime
     {
       if (hourlyPersonCount) {                                  // If this number is not zero then we need to send this last count
         state = REPORTING_STATE;
         break;
       }
-      if (Particle.connected()) {
-        disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
-      }
+      if (connectionMode) disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
       detachInterrupt(int2Pin);                                  // Done sensing for the day
       FRAMwrite16(CURRENTDAILYCOUNT, 0);                    // Reset the counts in FRAM as well
       FRAMwrite8(RESETCOUNT,resetCount);
@@ -322,50 +328,35 @@ void loop()
     } break;
 
   case NAPPING_STATE: {
-    if (verboseMode && state != oldState) publishStateTransition();
-      if (Particle.connected())
-        {
-          Particle.publish("State","Disconnecting from Particle");
-          disconnectFromParticle();                                       // If connected, we need to disconned and power down the modem
-        }
-        ledState = false;                                                 // Turn out the light
-        digitalWrite(blueLED,LOW);                                        // Turn off the LED
-        watchdogISR();                                                    // Pet the watchdog
-        int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
-        System.sleep(int2Pin, RISING, secondsToHour);             // Sensor will wake us with an interrupt
-        state = IDLE_STATE;                                      // Back to the IDLE_STATE after a nap
-    } break;
-
-    case LOW_BATTERY_STATE: {                                             // Sleep state but leaves the fuel gauge on
-      if (verboseMode && state != oldState) publishStateTransition();
-      if (Particle.connected()) {
-        disconnectFromParticle();                                       // If connected, we need to disconned and power down the modem
-      }
-      detachInterrupt(int2Pin);                                          // Done sensing for the day
-      ledState = false;
-      digitalWrite(blueLED,LOW);                                        // Turn off the LED
-      digitalWrite(tmp36Shutdwn, LOW);                                  // Turns off the temp sensor
+      if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+      if (connectionMode) disconnectFromParticle();                 // If connected, we need to disconned and power down the modem
       watchdogISR();                                                    // Pet the watchdog
       int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
-      System.sleep(SLEEP_MODE_DEEP,secondsToHour);                      // Very deep sleep till the next hour - then resets
-    } break;
+      System.sleep(int2Pin, RISING, secondsToHour);             // Sensor will wake us with an interrupt
+      delay(20);
+      state = IDLE_STATE;                                      // Back to the IDLE_STATE after a nap
+  } break;
 
-  case REPORTING_STATE: {
+  case LOW_BATTERY_STATE: {                                             // Sleep state but leaves the fuel gauge on
+    if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+    if (connectionMode) disconnectFromParticle();                      // If connected, we need to disconned and power down the modem
+    detachInterrupt(int2Pin);                                          // Done sensing for the day
+    digitalWrite(tmp36Shutdwn, LOW);                                  // Turns off the temp sensor
+    watchdogISR();                                                    // Pet the watchdog
+    int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
+    System.sleep(SLEEP_MODE_DEEP,secondsToHour);                      // Very deep sleep till the next hour - then resets
+  } break;
+
+  case REPORTING_STATE:
+    watchdogISR();                                                      // Pet the watchdog once an hour
+    pettingEnabled = false;                                             // Going to see the reporting process through before petting again
+    if (!connectionMode) connectToParticle();
     if (verboseMode && state != oldState) publishStateTransition();
-      watchdogISR();                                                      // Pet the watchdog once an hour
-      pettingEnabled = false;                                             // Going to see the reporting process through before petting again
-      if (!Particle.connected()) {
-        if (!connectToParticle()) {
-          resetTimeStamp = millis();
-          state = ERROR_STATE;
-          break;
-        }
-      }
-      takeMeasurements();                                                 // Update Temp, Battery and Signal Strength values
-      sendEvent();                                                        // Send data to Ubidots
-      webhookTimeStamp = millis();
-      state = RESP_WAIT_STATE;                                            // Wait for Response
-    } break;
+    takeMeasurements();                                                 // Update Temp, Battery and Signal Strength values
+    sendEvent();                                                        // Send data to Ubidots
+    webhookTimeStamp = millis();
+    state = RESP_WAIT_STATE;                                            // Wait for Response
+    break;
 
   case RESP_WAIT_STATE:
     if (verboseMode && state != oldState) publishStateTransition();
@@ -387,15 +378,11 @@ void loop()
     {
       Particle.publish("State","ERROR_STATE - Resetting");
       delay(2000);
-      System.reset();
-      /*                                       // This makes sure it goes through before reset
       if (resetCount <= 3)  System.reset();                 // Today, only way out is reset
       else {
-        resetCount = 0;
-        FRAMwrite8(RESETCOUNT,0);                           // Time for a hard reset
-        digitalWrite(hardResetPin,HIGH);                    // Zero the count so only every three
+        FRAMwrite8(RESETCOUNT,0);                           // Zero the ResetCount
+        fullModemReset();                                   // Full Modem reset and reboot
       }
-      */
     }
     break;
 
@@ -405,7 +392,21 @@ void loop()
 void recordCount() // This is where we check to see if an interrupt is set when not asleep or act on a tap that woke the Arduino
 {
   char data[256];                                           // Store the date in this character array - not global
-  sensorDetect = false;      // Reset the flag
+  sensorDetect = false;                                     // Reset the flag
+  source = readRegister(MMA8452_ADDRESS,0x0C);            // Read the interrupt source reg.
+  readRegister(MMA8452_ADDRESS,0x22);                 // Reads the PULSE_SRC register to reset it
+    Serial.print(currentEvent);
+    Serial.print(debounce);
+  if (millis() >= currentEvent + debounce) {              // Can read time in an ISR but it won't increment
+    currentEvent = millis();
+  }
+  else {
+    pinResetFast(blueLED);
+    return;
+  }
+    Serial.print(".");
+  detachInterrupt(int2Pin);                                  // Detach so we don't have retriggers
+    Serial.println(".");
   if ((source & 0x08)==0x08)  // We are only interested in the TAP register and ignore debounced taps
   {
     hourlyPersonCount++;                    // Increment the PersonCount
@@ -415,16 +416,17 @@ void recordCount() // This is where we check to see if an interrupt is set when 
     FRAMwrite32(CURRENTCOUNTSTIME, currentEvent);   // Write to FRAM - this is so we know when the last counts were saved
     snprintf(data, sizeof(data), "Car, hourlry count: %i, daily count: %i",hourlyPersonCount,dailyPersonCount);
     if (verboseMode) Particle.publish("Count",data);
+    Serial.println(data);
   }
-  else if ((source & 0x08) != 0x08) if(verboseMode) Particle.publish("Event","Interrupt not a tap");
-  if (!digitalRead(userSwitch)) {                           // A low value means someone is pushing this button - will trigger a send to Ubidots and take out of low power mode
-    if (lowPowerMode) {
-      Particle.publish("Mode","Normal Operations");
-      controlRegister = (0b1111110 & controlRegister);     // Will set the lowPowerMode bit to zero
-      FRAMwrite8(CONTROLREGISTER,controlRegister);
-      lowPowerMode = false;
-      connectToParticle();                                  // Reconnect to Particle for monitoring and management
-    }
+  pinResetFast(blueLED);
+  readRegister(MMA8452_ADDRESS,0x22);                 // Reads the PULSE_SRC register to reset it
+  attachInterrupt(int2Pin,sensorISR,RISING);                      // Accelerometer interrupt from low to high
+  if (!digitalRead(userSwitch) && lowPowerMode) {                           // A low value means someone is pushing this button - will trigger a send to Ubidots and take out of low power mode
+    Particle.publish("Mode","Normal Operations");
+    controlRegister = (0b1111110 & controlRegister);     // Will set the lowPowerMode bit to zero
+    FRAMwrite8(CONTROLREGISTER,controlRegister);
+    lowPowerMode = false;
+    connectToParticle();                                  // Reconnect to Particle for monitoring and management
   }
 }
 
@@ -488,24 +490,8 @@ int getTemperature()
 
 void sensorISR()
 {
-  static int i=0;
-  if (millis() >= currentEvent + debounce) {                                 // Can read time in an ISR but it won't increment
-    sensorDetect = true;                                  // sets the sensor flag for the main loop
-    currentEvent = millis();
-    ledState = !ledState;              // toggle the status of the LEDPIN:
-    pinSetFast(blueLED);    // update the LED pin itself
-  }
-  source = readRegister(MMA8452_ADDRESS,0x0C);            // Read the interrupt source reg.
-  do {                                                    // All these gymanastics are required to ensure the interrupt is reset
-      i++;                                                // Apparently, this is an issue with the MMA8452
-      readRegister(MMA8452_ADDRESS,0x22);                 // Reads the PULSE_SRC register to reset it
-      if (i>=10)                                          // Not sure if this is requried - take out after a month if never triggered
-      {
-        initMMA8452(accelFullScaleRange,dataRate);        // Last Resort
-        if(digitalRead(int2Pin)) digitalWrite(hardResetPin,HIGH);       // If all else fails, reset the device and the accelerometer
-      }
-  } while(digitalRead(int2Pin));                          // Won't exit the do loop until the accelerometer's interrupt is reset
-  pinResetFast(blueLED);
+  sensorDetect = true;                                  // sets the sensor flag for the main loop
+  pinSetFast(blueLED);    // update the LED pin itself
 }
 
 
@@ -529,16 +515,20 @@ bool connectToParticle()
   Particle.connect();                                      // Connect to Particle
   if(!waitFor(Particle.connected,30000)) return false;     // Connect to Particle - give it 30 seconds
   Particle.process();
+  controlRegister = FRAMread8(CONTROLREGISTER);
+  connectionMode = true;
+  controlRegister = (0b00010000 | controlRegister);          // Turn on connectionMode
+  FRAMwrite8(CONTROLREGISTER, controlRegister);
   return true;
 }
 
 bool disconnectFromParticle()
 {
-  Particle.disconnect();                                   // Disconnect from Particle in prep for sleep
-  waitFor(notConnected,10000);
-  Cellular.disconnect();                                   // Disconnect from the cellular network
-  delay(3000);
   Cellular.off();                                           // Turn off the cellular modem
+  controlRegister = FRAMread8(CONTROLREGISTER);
+  connectionMode = false;
+  controlRegister = (0b11101111 & controlRegister);          // Turn off connectionMode
+  FRAMwrite8(CONTROLREGISTER, controlRegister);
   return true;
 }
 
@@ -776,5 +766,21 @@ void publishStateTransition(void)
   oldState = state;
   waitUntil(meterParticlePublish);
   Particle.publish("State Transition",stateTransitionString);
+  Serial.println(stateTransitionString);
   lastPublish = millis();
+}
+
+void fullModemReset() {  // Adapted form Rikkas7's https://github.com/rickkas7/electronsample
+
+	Particle.disconnect(); 	                                         // Disconnect from the cloud
+	unsigned long startTime = millis();  	                           // Wait up to 15 seconds to disconnect
+	while(Particle.connected() && millis() - startTime < 15000) {
+		delay(100);
+	}
+	// Reset the modem and SIM card
+	// 16:MT silent reset (with detach from network and saving of NVM parameters), with reset of the SIM card
+	Cellular.command(30000, "AT+CFUN=16\r\n");
+	delay(1000);
+	// Go into deep sleep for 10 seconds to try to reset everything. This turns off the modem as well.
+	System.sleep(SLEEP_MODE_DEEP, 10);
 }

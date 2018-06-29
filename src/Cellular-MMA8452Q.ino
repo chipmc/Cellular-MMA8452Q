@@ -179,7 +179,7 @@ void setup()                                                      // Note: Disco
   Particle.variable("lowPowerMode",lowPowerMode);
   Particle.variable("OpenTime",openTime);
   Particle.variable("CloseTime",closeTime);
-  Particle.variable("Debounce",debounce);
+  Particle.variable("Debounce",debounceStr);
 
 
   Particle.function("resetFRAM", resetFRAM);
@@ -259,6 +259,7 @@ void setup()                                                      // Note: Disco
   if (!digitalRead(userSwitch)) {                                       // Rescue mode to locally take lowPowerMode so you can connect to device
     lowPowerMode = false;                                               // Press the user switch while resetting the device
     controlRegister = (0b1111110 & controlRegister);                    // Turn off Low power mode
+    controlRegister = (0b00010000 | controlRegister);                   // Turn on the connectionMode
     FRAMwrite8(CONTROLREGISTER,controlRegister);                        // Write it to the register
     openTime = 0;                                                       // Device may alos be sleeping due to time or TimeZone setting
     FRAMwrite8(OPENTIMEADDR,0);                                         // Reset open and close time values to ensure device is awake
@@ -290,7 +291,7 @@ void loop()
 {
   switch(state) {
   case IDLE_STATE:
-    if (verboseMode && state != oldState) publishStateTransition();
+    if (connectionMode && verboseMode && state != oldState) publishStateTransition();
     if(hourlyPersonCountSent) {                                                   // Cleared here as there could be counts coming in while "in Flight"
       hourlyPersonCount -= hourlyPersonCountSent;                                 // Confirmed that count was recevied - clearing
       FRAMwrite16(CURRENTHOURLYCOUNT, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
@@ -305,24 +306,18 @@ void loop()
 
   case SLEEPING_STATE: {                                        // This state is triggered once the park closes and runs until it opens
     if (connectionMode && verboseMode && state != oldState) publishStateTransition();
-    if (!readyForBed)                                           // Only do these things once - at bedtime
-    {
-      if (hourlyPersonCount) {                                  // If this number is not zero then we need to send this last count
-        state = REPORTING_STATE;
-        break;
-      }
-      if (connectionMode) disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
-      detachInterrupt(int2Pin);                                  // Done sensing for the day
-      FRAMwrite16(CURRENTDAILYCOUNT, 0);                    // Reset the counts in FRAM as well
-      FRAMwrite8(RESETCOUNT,resetCount);
-      FRAMwrite16(CURRENTHOURLYCOUNT, 0);
-      dailyPersonCount = resetCount = hourlyPersonCount = 0;
-      ledState = false;
-      digitalWrite(blueLED,LOW);                                // Turn off the LED
-      digitalWrite(tmp36Shutdwn, LOW);                          // Turns off the temp sensor
-      watchdogISR();                                                    // Pet the watchdog
-      readyForBed = true;                                       // Set the flag for the night
+    if (hourlyPersonCount) {                                  // If this number is not zero then we need to send this last count
+      state = REPORTING_STATE;
+      break;
     }
+    if (connectionMode) disconnectFromParticle();                               // If connected, we need to disconned and power down the modem
+    detachInterrupt(int2Pin);                                  // Done sensing for the day
+    FRAMwrite16(CURRENTDAILYCOUNT, 0);                    // Reset the counts in FRAM as well
+    FRAMwrite8(RESETCOUNT,0);
+    FRAMwrite16(CURRENTHOURLYCOUNT, 0);
+    digitalWrite(blueLED,LOW);                                // Turn off the LED
+    digitalWrite(tmp36Shutdwn, LOW);                          // Turns off the temp sensor
+    watchdogISR();                                                    // Pet the watchdog
     int secondsToHour = (60*(60 - Time.minute()));              // Time till the top of the hour
     System.sleep(SLEEP_MODE_DEEP,secondsToHour);                // Very deep sleep till the next hour - then resets
     } break;
@@ -333,7 +328,7 @@ void loop()
       watchdogISR();                                                    // Pet the watchdog
       int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
       System.sleep(int2Pin, RISING, secondsToHour);             // Sensor will wake us with an interrupt
-      delay(20);
+      delay(30);
       state = IDLE_STATE;                                      // Back to the IDLE_STATE after a nap
   } break;
 
@@ -354,7 +349,6 @@ void loop()
     if (verboseMode && state != oldState) publishStateTransition();
     takeMeasurements();                                                 // Update Temp, Battery and Signal Strength values
     sendEvent();                                                        // Send data to Ubidots
-    webhookTimeStamp = millis();
     state = RESP_WAIT_STATE;                                            // Wait for Response
     break;
 
@@ -385,18 +379,17 @@ void loop()
       }
     }
     break;
-
   }
 }
 
 void recordCount() // This is where we check to see if an interrupt is set when not asleep or act on a tap that woke the Arduino
 {
   char data[256];                                           // Store the date in this character array - not global
+  pinSetFast(blueLED);                // update the LED pin itself
   sensorDetect = false;                                     // Reset the flag
   source = readRegister(MMA8452_ADDRESS,0x0C);            // Read the interrupt source reg.
   readRegister(MMA8452_ADDRESS,0x22);                 // Reads the PULSE_SRC register to reset it
-    Serial.print(currentEvent);
-    Serial.print(debounce);
+
   if (millis() >= currentEvent + debounce) {              // Can read time in an ISR but it won't increment
     currentEvent = millis();
   }
@@ -404,9 +397,7 @@ void recordCount() // This is where we check to see if an interrupt is set when 
     pinResetFast(blueLED);
     return;
   }
-    Serial.print(".");
-  detachInterrupt(int2Pin);                                  // Detach so we don't have retriggers
-    Serial.println(".");
+
   if ((source & 0x08)==0x08)  // We are only interested in the TAP register and ignore debounced taps
   {
     hourlyPersonCount++;                    // Increment the PersonCount
@@ -416,11 +407,10 @@ void recordCount() // This is where we check to see if an interrupt is set when 
     FRAMwrite32(CURRENTCOUNTSTIME, currentEvent);   // Write to FRAM - this is so we know when the last counts were saved
     snprintf(data, sizeof(data), "Car, hourlry count: %i, daily count: %i",hourlyPersonCount,dailyPersonCount);
     if (verboseMode) Particle.publish("Count",data);
-    Serial.println(data);
   }
   pinResetFast(blueLED);
   readRegister(MMA8452_ADDRESS,0x22);                 // Reads the PULSE_SRC register to reset it
-  attachInterrupt(int2Pin,sensorISR,RISING);                      // Accelerometer interrupt from low to high
+
   if (!digitalRead(userSwitch) && lowPowerMode) {                           // A low value means someone is pushing this button - will trigger a send to Ubidots and take out of low power mode
     Particle.publish("Mode","Normal Operations");
     controlRegister = (0b1111110 & controlRegister);     // Will set the lowPowerMode bit to zero
@@ -436,6 +426,7 @@ void sendEvent()
   char data[256];                                         // Store the date in this character array - not global
   snprintf(data, sizeof(data), "{\"hourly\":%i, \"daily\":%i,\"battery\":%i, \"temp\":%i, \"resets\":%i}",hourlyPersonCount, dailyPersonCount, stateOfCharge, temperatureF,resetCount);
   Particle.publish("Ubidots-Hook", data, PRIVATE);
+  webhookTimeStamp = millis();
   hourlyPersonCountSent = hourlyPersonCount; // This is the number that was sent to Ubidots - will be subtracted once we get confirmation
   currentHourlyPeriod = Time.hour();  // Change the time period
   dataInFlight = true; // set the data inflight flag
@@ -490,8 +481,7 @@ int getTemperature()
 
 void sensorISR()
 {
-  sensorDetect = true;                                  // sets the sensor flag for the main loop
-  pinSetFast(blueLED);    // update the LED pin itself
+  sensorDetect = true;                // sets the sensor flag for the main loop
 }
 
 
@@ -505,16 +495,20 @@ void watchdogISR()
 
 bool connectToParticle()
 {
+  /*
   if (!Cellular.ready())
   {
     Cellular.on();                                           // turn on the Modem
     Cellular.connect();                                      // Connect to the cellular network
     if(!waitFor(Cellular.ready,90000)) return false;         // Connect to cellular - give it 90 seconds
   }
+
   Particle.process();
+*/
+  Cellular.on();
   Particle.connect();                                      // Connect to Particle
-  if(!waitFor(Particle.connected,30000)) return false;     // Connect to Particle - give it 30 seconds
-  Particle.process();
+  //if(!waitFor(Particle.connected,30000)) return false;     // Connect to Particle - give it 30 seconds
+  //Particle.process();
   controlRegister = FRAMread8(CONTROLREGISTER);
   connectionMode = true;
   controlRegister = (0b00010000 | controlRegister);          // Turn on connectionMode
@@ -603,7 +597,6 @@ int hardResetNow(String command)   // Will perform a hard reset on the Electron
 int setDebounce(String command)  // This is the amount of time in seconds we will wait before starting a new session
 {
   char * pEND;
-  char data[256];
   float inputDebounce = strtof(command,&pEND);                       // Looks for the first integer and interprets it
   if ((inputDebounce < 0.0) | (inputDebounce > 5.0)) return 0;   // Make sure it falls in a valid range or send a "fail" result
   debounce = int(inputDebounce*1000);                   // debounce is how long we must space events to prevent overcounting
@@ -612,8 +605,7 @@ int setDebounce(String command)  // This is the amount of time in seconds we wil
   snprintf(debounceStr,sizeof(debounceStr),"%2.1f sec",inputDebounce);
   if (verboseMode) {
     waitUntil(meterParticlePublish);
-    snprintf(data, sizeof(data), "Debounce is: %2.1f seconds",debounce);
-    Particle.publish("Variables",data);
+    Particle.publish("Debounce",debounceStr);
     lastPublish = millis();
   }
   return 1;
@@ -771,7 +763,6 @@ void publishStateTransition(void)
 }
 
 void fullModemReset() {  // Adapted form Rikkas7's https://github.com/rickkas7/electronsample
-
 	Particle.disconnect(); 	                                         // Disconnect from the cloud
 	unsigned long startTime = millis();  	                           // Wait up to 15 seconds to disconnect
 	while(Particle.connected() && millis() - startTime < 15000) {

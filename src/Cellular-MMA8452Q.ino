@@ -375,7 +375,7 @@ void loop()
       if (resetCount <= 3)  System.reset();                 // Today, only way out is reset
       else {
         FRAMwrite8(RESETCOUNT,0);                           // Zero the ResetCount
-        fullModemReset();                                   // Full Modem reset and reboot
+        fullModemReset();                                   // Full Modem reset and reboots
       }
     }
     break;

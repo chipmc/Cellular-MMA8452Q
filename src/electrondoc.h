@@ -29,9 +29,9 @@
  *                                              \___________________________/
  *
  *
- * D0 -
- * D1 -
- * D3 - PIR Digital Signal (active high) - intPin
+ * 
+ *
+ * D2 - Interrupt pin from accelerometer
  * D6 - Done Pin - connected to Watchdog Timer
  * D7 - LED on Electron board - LEDPIN
  * A0 - TMP36 Input -  tmp36Pin

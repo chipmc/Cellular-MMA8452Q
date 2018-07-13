@@ -25,22 +25,22 @@
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
-    versionAddr =0x0,                               // Where we store the memory map version number
-    sensitivityAddr= 0x1 ,                          // Sensitivity for Accelerometer sensors
-    debounceAddr= 0x2,                              // Where we store debounce in cSec or 1/10s of a sec (ie 1.6sec is stored as 16)
-    resetCountAddr =0x3 ,                           // This is where we keep track of how often the Electron was reset
-    timeZoneAddr = 0x4  ,                           // Store the local time zone data
-    openTimeAddr= 0x5 ,                             // Hour for opening the park / store / etc - military time (e.g. 6 is 6am)
-    closeTimeAddr =0x6  ,                           // Hour for closing of the park / store / etc - military time (e.g 23 is 11pm)
-    controlRegisterAddr =0x7 ,                      // This is the control register for storing the current state
-    currentHourlyCountAddr =0x8 ,                   // Current Hourly Count - 16 bits
-    currentDailyCountAddr =0xC ,                    // Current Daily Count - 16 bits
-    currentCountsTimeAddr =0xE ,                    // Time of last count - 32 bits
+    versionAddr           = 0x0,                    // Where we store the memory map version number
+    sensitivityAddr       = 0x1,                    // Sensitivity for Accelerometer sensors
+    debounceAddr          = 0x2,                    // Where we store debounce in cSec or 1/10s of a sec (ie 1.6sec is stored as 16)
+    resetCountAddr        = 0x3,                    // This is where we keep track of how often the Electron was reset
+    timeZoneAddr          = 0x4,                    // Store the local time zone data
+    openTimeAddr          = 0x5,                    // Hour for opening the park / store / etc - military time (e.g. 6 is 6am)
+    closeTimeAddr         = 0x6,                    // Hour for closing of the park / store / etc - military time (e.g 23 is 11pm)
+    controlRegisterAddr   = 0x7,                    // This is the control register for storing the current state
+    currentHourlyCountAddr =0x8,                    // Current Hourly Count - 16 bits
+    currentDailyCountAddr = 0xC,                    // Current Daily Count - 16 bits
+    currentCountsTimeAddr = 0xE,                    // Time of last count - 32 bits
   };
 };
 
 const int versionNumber = 9;                        // Increment this number each time the memory map is changed
-const char releaseNumber[6] = "0.60";               // Displays the release on the menu
+const char releaseNumber[6] = "0.61";               // Displays the release on the menu
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                      // Library for FRAM functions
@@ -134,7 +134,7 @@ void setup()                                        // Note: Disconnected Setup(
 {
   Wire.begin();                                     //Create a Wire object
 
-  pinMode(int2Pin,INPUT);                           // accelerometer interrupt pinMode
+  pinMode(int2Pin,INPUT_PULLDOWN);                  // accelerometer interrupt pinMode
   pinMode(wakeUpPin,INPUT);                         // This pin is active HIGH
   pinMode(userSwitch,INPUT);                        // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
@@ -313,15 +313,14 @@ void loop()
   case NAPPING_STATE: {
       if (connectionMode && verboseMode && state != oldState) publishStateTransition();
       stayAwake = debounce;                                           // Ensures that we stay awake long enough to debounce a tap
-      if (connectionMode) disconnectFromParticle();                   // If connected, we need to disconned and power down the modem
+      if (connectionMode || Particle.connected()) disconnectFromParticle();                   // If connected, we need to disconned and power down the modem
       watchdogISR();                                                  // Pet the watchdog
       noInterrupts();
       detachInterrupt(int2Pin);                                       // Detach since sleep will monitor the int2Pin
-      int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
       interrupts();
-      if (digitalRead(int2Pin)) System.reset();
-      System.sleep(int2Pin, RISING, wakeInSeconds);                   // Wake on either int2Pin or the top of the hour
-      if (digitalRead(int2Pin)) {                                     // Need to test if Tap or Time woke us up
+      int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
+      if (!digitalRead(int2Pin)) System.sleep(int2Pin, RISING, wakeInSeconds);  // Wake on either int2Pin or the top of the hour
+      if (System.wokenUpByPin()) {                                           // Need to test if Tap or Time woke us up
         awokeFromNap = true;                                          // This flag will allow us to bypass the debounce in the recordCount function
         recordCount();                                                // Count the tap that awoke the device
         stayAwakeTimeStamp = millis();                                // Allows us to ensure we stay awake long enough to debounce
@@ -502,6 +501,7 @@ bool connectToParticle()
 
 bool disconnectFromParticle()
 {
+  Particle.disconnect();
   Cellular.off();                                                     // Turn off the cellular modem
   controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);
   connectionMode = false;

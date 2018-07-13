@@ -315,8 +315,11 @@ void loop()
       stayAwake = debounce;                                           // Ensures that we stay awake long enough to debounce a tap
       if (connectionMode) disconnectFromParticle();                   // If connected, we need to disconned and power down the modem
       watchdogISR();                                                  // Pet the watchdog
+      noInterrupts();
       detachInterrupt(int2Pin);                                       // Detach since sleep will monitor the int2Pin
       int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
+      interrupts();
+      if (digitalRead(int2Pin)) System.reset();
       System.sleep(int2Pin, RISING, wakeInSeconds);                   // Wake on either int2Pin or the top of the hour
       if (digitalRead(int2Pin)) {                                     // Need to test if Tap or Time woke us up
         awokeFromNap = true;                                          // This flag will allow us to bypass the debounce in the recordCount function

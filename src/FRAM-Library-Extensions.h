@@ -75,7 +75,7 @@ void FRAMwrite32(int address, unsigned long value)  // Write 32 bits to FRAM
 void ResetFRAM()  // This will reset the FRAM - set the version and preserve delay and sensitivity
 {
     // Note - have to hard code the size here due to this issue - http://www.microchip.com/forums/m501193.aspx
-    byte tempControlReg = FRAMread8(CONTROLREGISTER);
+    byte tempControlReg = FRAMread8(FRAM::controlRegisterAddr);
     Particle.publish("FRAM","Resetting in progress");
     for (unsigned long i=8; i < 32768; i++) {  // Start at 4 to not overwrite debounce and sensitivity
         FRAMwrite8(i,0x0);
@@ -84,6 +84,6 @@ void ResetFRAM()  // This will reset the FRAM - set the version and preserve del
         if (i==(24576)) Particle.publish("Event", "Fram Reset 3/4 done");
         if (i==32767) Particle.publish("Event", "Fram Reset done");
     }
-    FRAMwrite8(CONTROLREGISTER,tempControlReg);   // Preserce the control register values
-    FRAMwrite8(VERSIONADDR,VERSIONNUMBER);  // Reset version to match #define value for sketch
+    FRAMwrite8(FRAM::controlRegisterAddr,tempControlReg);   // Preserce the control register values
+    FRAMwrite8(FRAM::versionAddr,versionNumber);  // Reset version to match #define value for sketch
 }

@@ -60,7 +60,7 @@ void MMA8452Active()
 
 void initMMA8452(byte fsr, byte dataRate)
 {
-  byte setSensitivity = FRAMread8(SENSITIVITYADDR);
+  byte setSensitivity = FRAMread8(FRAM::sensitivityAddr);
   MMA8452Standby();  // Must be in standby to change registers
   // Set up the full scale range to 2, 4, or 8g.
   if ((fsr==2)||(fsr==4)||(fsr==8))

@@ -49,7 +49,7 @@
 #define HOURLYCOUNTOFFSET 4         // Offsets for the values in the hourly words
 #define HOURLYBATTOFFSET 6          // Where the hourly battery charge is stored
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "0.58"
+#define SOFTWARERELEASENUMBER "0.59"
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                           // Library for FRAM functions
@@ -84,11 +84,13 @@ const int blueLED =       D7;                       // This LED is on the Electr
 
 
 // Timing Variables
-const unsigned long stayAwake = 90000;              // In lowPowerMode, how long to stay awake every hour
+const int wakeBoundary = 1*3600 + 0*60 + 0;         // 1 hour 0 minutes 0 seconds
+const unsigned long stayAwakeLong = 90000;          // In lowPowerMode, how long to stay awake every hour
 const unsigned long webhookWait = 45000;            // How long will we wair for a WebHook response
 const unsigned long resetWait = 30000;              // How long will we wait in ERROR_STATE until reset
 const int publishFrequency = 1000;                  // We can only publish once a second
 unsigned long stayAwakeTimeStamp = 0;               // Timestamps for our timing variables..
+unsigned long stayAwake;                            // Stores the time we need to wait before napping
 unsigned long webhookTimeStamp = 0;                 // Webhooks...
 unsigned long resetTimeStamp = 0;                   // Resets - this keeps you from falling into a reset loop
 unsigned long publishTimeStamp = 0;                 // Keep track of when we publish a webhook
@@ -98,6 +100,7 @@ unsigned long lastPublish = 0;                      // Can only publish 1/sec on
 int temperatureF;                                   // Global variable so we can monitor via cloud variable
 int resetCount;                                     // Counts the number of times the Electron has had a pin reset
 volatile bool ledState = LOW;                       // variable used to store the last LED status, to toggle the light
+bool awokeFromNap = false;                          // In low power mode, we can't use standard millis to debounce
 bool readyForBed = false;                           // Checks to see if steps for sleep have been completed
 bool pettingEnabled = true;                         // Let's us pet the hardware watchdog
 bool dataInFlight = false;                          // Tracks if we have sent data but not yet cleared it from counts until we get confirmation
@@ -278,6 +281,8 @@ void setup()                                        // Note: Disconnected Setup(
   attachInterrupt(wakeUpPin, watchdogISR, RISING);                    // The watchdog timer will signal us and we have to respond
 
   if (state != ERROR_STATE) state = IDLE_STATE;                       // IDLE unless error from above code
+
+  stayAwake = stayAwakeLong;                                          // Keeps Electron awake after reboot - helps with recovery
 }
 
 void loop()
@@ -311,20 +316,25 @@ void loop()
     digitalWrite(blueLED,LOW);                                        // Turn off the LED
     digitalWrite(tmp36Shutdwn, LOW);                                  // Turns off the temp sensor
     watchdogISR();                                                    // Pet the watchdog
-    int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
-    System.sleep(SLEEP_MODE_DEEP,secondsToHour);                      // Very deep sleep till the next hour - then resets
+    int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
+    System.sleep(SLEEP_MODE_DEEP,wakeInSeconds);                      // Very deep sleep till the next hour - then resets
     } break;
 
   case NAPPING_STATE: {
       if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+      stayAwake = debounce;                                           // Ensures that we stay awake long enough to debounce a tap
       if (connectionMode) disconnectFromParticle();                   // If connected, we need to disconned and power down the modem
       watchdogISR();                                                  // Pet the watchdog
-      int secondsToHour = (60*(60 - Time.minute()));                  // Time till the top of the hour
       detachInterrupt(int2Pin);                                       // Detach since sleep will monitor the int2Pin
-      System.sleep(int2Pin, RISING, secondsToHour);                   // Sensor will wake us with an interrupt
-      if (digitalRead(int2Pin)) sensorDetect = true;                  // Need to see if it was int2Pin or time that woke us
+      int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
+      System.sleep(int2Pin, RISING, wakeInSeconds);                   // Wake on either int2Pin or the top of the hour
+      if (digitalRead(int2Pin)) {                                     // Need to test if Tap or Time woke us up
+        awokeFromNap = true;                                          // This flag will allow us to bypass the debounce in the recordCount function
+        recordCount();                                                // Count the tap that awoke the device
+        stayAwakeTimeStamp = millis();                                // Allows us to ensure we stay awake long enough to debounce
+      }
       attachInterrupt(int2Pin,sensorISR,RISING);                      // Reattach Accelerometer interrupt from low to high
-      state = IDLE_STATE;                                             // Back to the IDLE_STATE after a nap
+      state = IDLE_STATE;                                             // Back to the IDLE_STATE after a nap will come back after the stayAwake time is over
   } break;
 
   case LOW_BATTERY_STATE: {                                           // Sleep state but leaves the fuel gauge on
@@ -339,6 +349,7 @@ void loop()
 
   case REPORTING_STATE:
     watchdogISR();                                                    // Pet the watchdog once an hour
+    stayAwake = stayAwakeLong;                                        // Keeps the Electron awake for longer once reporting - helps with updates and system Checks
     pettingEnabled = false;                                           // Going to see the reporting process through before petting again
     if (!connectionMode) connectToParticle();                         // Need to connect in oder to report
     if (verboseMode && state != oldState) publishStateTransition();
@@ -385,8 +396,9 @@ void recordCount() // This is where we check to see if an interrupt is set when 
   source = readRegister(MMA8452_ADDRESS,0x0C);                        // Read the interrupt source reg.
   readRegister(MMA8452_ADDRESS,0x22);                                 // Reads the PULSE_SRC register to reset it
 
-  if (millis() >= currentEvent + debounce) {                          // If this event is outside the debounce time, proceed
+  if ((millis() >= currentEvent + debounce) || awokeFromNap) {        // If this event is outside the debounce time, proceed
     currentEvent = millis();
+    awokeFromNap = false;                                             // Reset the awoke flag
   }
   else {
     pinResetFast(blueLED);                                            // If it is not, turn off the LED and return

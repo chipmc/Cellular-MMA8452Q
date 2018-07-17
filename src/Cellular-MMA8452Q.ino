@@ -40,7 +40,7 @@ namespace FRAM {                                    // Moved to namespace instea
 };
 
 const int versionNumber = 9;                        // Increment this number each time the memory map is changed
-const char releaseNumber[6] = "0.61";               // Displays the release on the menu
+const char releaseNumber[6] = "0.62";               // Displays the release on the menu
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                      // Library for FRAM functions
@@ -293,13 +293,13 @@ void loop()
     break;
 
   case SLEEPING_STATE: {                                              // This state is triggered once the park closes and runs until it opens
+    detachInterrupt(int2Pin);                                         // Done sensing for the day
     if (connectionMode && verboseMode && state != oldState) publishStateTransition();
     if (hourlyPersonCount) {                                          // If this number is not zero then we need to send this last count
       state = REPORTING_STATE;
       break;
     }
     if (connectionMode) disconnectFromParticle();                     // If connected, we need to disconned and power down the modem
-    detachInterrupt(int2Pin);                                         // Done sensing for the day
     FRAMwrite16(FRAM::currentDailyCountAddr, 0);                                // Reset the counts in FRAM as well
     FRAMwrite8(FRAM::resetCountAddr,0);
     FRAMwrite16(FRAM::currentHourlyCountAddr, 0);
@@ -313,19 +313,22 @@ void loop()
   case NAPPING_STATE: {
       if (connectionMode && verboseMode && state != oldState) publishStateTransition();
       stayAwake = debounce;                                           // Ensures that we stay awake long enough to debounce a tap
+      stayAwakeTimeStamp = millis();                                  // Allows us to ensure we stay awake long enough to debounce
       if (connectionMode || Particle.connected()) disconnectFromParticle();                   // If connected, we need to disconned and power down the modem
-      watchdogISR();                                                  // Pet the watchdog
-      noInterrupts();
-      detachInterrupt(int2Pin);                                       // Detach since sleep will monitor the int2Pin
-      interrupts();
-      int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
-      if (!digitalRead(int2Pin)) System.sleep(int2Pin, RISING, wakeInSeconds);  // Wake on either int2Pin or the top of the hour
-      if (System.wokenUpByPin()) {                                           // Need to test if Tap or Time woke us up
-        awokeFromNap = true;                                          // This flag will allow us to bypass the debounce in the recordCount function
-        recordCount();                                                // Count the tap that awoke the device
-        stayAwakeTimeStamp = millis();                                // Allows us to ensure we stay awake long enough to debounce
+      //watchdogISR();                                                  // Pet the watchdog
+      //int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
+      //if (!pinReadFast(int2Pin)) readRegister(MMA8452_ADDRESS,0x22);  // Reads the PULSE_SRC register to reset it - just in case
+      //noInterrupts();
+      //detachInterrupt(int2Pin);                                       // Detach since sleep will monitor the int2Pin
+      //interrupts();
+      //if (!pinReadFast(int2Pin)) System.sleep(int2Pin, RISING, wakeInSeconds);                   // Wake on either int2Pin or the top of the hour
+      //attachInterrupt(int2Pin,sensorISR,RISING);                      // Reattach Accelerometer interrupt from low to high
+      /*
+      delay(20);
+      if (System.wokenUpByPin()) {
+        awokeFromNap = sensorDetect = true;                 // This flag will allow us to bypass the debounce in the recordCount function
       }
-      attachInterrupt(int2Pin,sensorISR,RISING);                      // Reattach Accelerometer interrupt from low to high
+      */
       state = IDLE_STATE;                                             // Back to the IDLE_STATE after a nap will come back after the stayAwake time is over
   } break;
 

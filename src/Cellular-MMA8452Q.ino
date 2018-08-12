@@ -222,9 +222,9 @@ void setup()                                        // Note: Disconnected Setup(
   else Time.zone(0);                                                  // Default is GMT in case proper value not in FRAM
 
   controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);                       // Read the Control Register for system modes
-  lowPowerMode    = (0b00000001 & controlRegisterValue);                   // Bitwise AND to set the lowPowerMode flag from control Register
-  verboseMode     = (0b00001000 & controlRegisterValue);                   // verboseMode
+  lowPowerMode    = (0b00000001 & controlRegister);                     // Set the lowPowerMode
   solarPowerMode  = (0b00000100 & controlRegisterValue);                   // solarPowerMode
+  verboseMode     = (0b00001000 & controlRegisterValue);                   // verboseMode
   connectionMode  = (0b00010000 & controlRegisterValue);                   // connected mode 1 = connected and 0 = disconnected
 
   PMICreset();                                                        // Executes commands that set up the PMIC for Solar charging
@@ -604,6 +604,7 @@ int setSensivty(String command)  // Will accept a new debounce value in the form
   if (verboseMode) Particle.publish("Count",data);
   return 1;
 }
+
 int sendNow(String command) // Function to force sending data in current hour
 {
   if (command == "1")
@@ -683,7 +684,7 @@ int setOpenTime(String command)
   char * pEND;
   char data[256];
   int tempTime = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
-  if ((tempTime < 0) || (tempTime > 23)) return 0;   // Make sure it falls in a valid range or send a "fail" result
+  if ((tempTime < 0) || (tempTime > 12)) return 0;   // Make sure it falls in a valid range or send a "fail" result
   openTime = tempTime;
   FRAMwrite8(FRAM::openTimeAddr,openTime);                             // Store the new value in FRAMwrite8
   snprintf(data, sizeof(data), "Open time set to %i",openTime);
@@ -696,7 +697,7 @@ int setCloseTime(String command)
   char * pEND;
   char data[256];
   int tempTime = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
-  if ((tempTime < 0) || (tempTime > 24)) return 0;   // Make sure it falls in a valid range or send a "fail" result
+  if ((tempTime < 12) || (tempTime > 24)) return 0;   // Make sure it falls in a valid range or send a "fail" result
   closeTime = tempTime;
   FRAMwrite8(FRAM::closeTimeAddr,closeTime);                             // Store the new value in FRAMwrite8
   snprintf(data, sizeof(data), "Closing time set to %i",closeTime);

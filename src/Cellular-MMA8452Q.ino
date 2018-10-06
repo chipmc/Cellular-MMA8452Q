@@ -40,7 +40,7 @@ namespace FRAM {                                    // Moved to namespace instea
 };
 
 const int versionNumber = 9;                        // Increment this number each time the memory map is changed
-const char releaseNumber[6] = "0.62";               // Displays the release on the menu
+const char releaseNumber[6] = "0.63";               // Displays the release on the menu
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"                      // Library for FRAM functions
@@ -222,7 +222,7 @@ void setup()                                        // Note: Disconnected Setup(
   else Time.zone(0);                                                  // Default is GMT in case proper value not in FRAM
 
   controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);                       // Read the Control Register for system modes
-  lowPowerMode    = (0b00000001 & controlRegister);                     // Set the lowPowerMode
+  lowPowerMode    = (0b00000001 & controlRegisterValue);                     // Set the lowPowerMode
   solarPowerMode  = (0b00000100 & controlRegisterValue);                   // solarPowerMode
   verboseMode     = (0b00001000 & controlRegisterValue);                   // verboseMode
   connectionMode  = (0b00010000 & controlRegisterValue);                   // connected mode 1 = connected and 0 = disconnected
@@ -396,6 +396,7 @@ void recordCount() // This is where we check to see if an interrupt is set when 
     awokeFromNap = false;                                             // Reset the awoke flag
   }
   else {
+    if(verboseMode && Particle.connected()) Particle.publish("Event","Debounced");
     pinResetFast(blueLED);                                            // If it is not, turn off the LED and return
     return;
   }
